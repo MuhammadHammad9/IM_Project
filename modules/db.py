@@ -190,6 +190,17 @@ class Database:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def get_global_conversation(self, limit: int = 50) -> List[Dict]:
+        """Return the last `limit` messages sent to the ALL channel."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM messages
+                   WHERE recipient = 'ALL'
+                   ORDER BY id DESC LIMIT ?""",
+                (limit,)
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
     # =========================================================================
     # File operations
     # =========================================================================

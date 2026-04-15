@@ -53,7 +53,7 @@ from modules.messaging   import (
     new_msg_id, now_timestamp, now_display,
     build_chat_packet, build_system_packet, build_status_packet,
     build_typing_packet, build_userlist_packet, build_file_packet,
-    build_search_results_packet,
+    build_search_results_packet, build_history_packet,
     build_login_ok_packet, build_login_error_packet, build_signup_ok_packet
 )
 from modules.file_handler import save_file_from_b64, MAX_FILE_BYTES
@@ -84,12 +84,9 @@ clients_lock        = threading.Lock()
 
 def receive_line(conn: socket.socket) -> str:
     """
-    Read bytes one at a time until we see a newline, then return the decoded
-    string (without the newline).  Returns '' if the connection is closed.
-
-    WHY one byte at a time?
-    TCP is a stream — recv(4096) might return half a message or two messages
-    glued together.  Reading until '\n' gives exactly one JSON packet.
+    Thin wrapper kept for auth phase — in handle_client we use makefile()
+    for proper buffering. This reads until newline, one byte at a time.
+    Only used for the first (auth) packet.
     """
     data = b""
     while True:
@@ -260,7 +257,10 @@ def handle_file(data: dict, username: str):
         broadcast_to_all(packet)
     else:
         send_to_user(recipient, packet)
-        send_to_user(username, packet)   # confirmation to sender
+        # Send a lightweight delivered status back to sender — NOT the full
+        # base64 payload, which caused proxy LimitOverrunError & disconnects.
+        db.update_message_status(msg_id, "delivered")
+        send_to_user(username, build_status_packet(msg_id, "delivered"))
 
 
 def handle_typing(data: dict, username: str):
@@ -320,6 +320,38 @@ def handle_search(data: dict, username: str):
     send_to_user(username, build_search_results_packet(query, results))
 
 
+def handle_history_request(data: dict, username: str):
+    """
+    Fetch up to 50 messages for a given contact.
+    If contact == "ALL", grabs global conversation.
+    Otherwise, grabs direct messages between user and contact.
+    """
+    contact = data.get("contact", "")
+    if not contact:
+        return
+
+    if contact == "ALL":
+        msgs = db.get_global_conversation(50)
+    else:
+        msgs = db.get_conversation(username, contact, 50)
+    
+    # Format them cleanly before sending
+    formatted_msgs = []
+    for m in msgs:
+        formatted_msgs.append({
+            "id": m["msg_id"],
+            "sender": m["sender"],
+            "recipient": m["recipient"],
+            "body": m["body"],
+            "time": m["timestamp"][11:16],  # extract HH:MM
+            "status": m["status"]
+        })
+
+    packet = build_history_packet(contact, formatted_msgs)
+    send_to_user(username, packet)
+    log.info(f"HISTORY served for {contact} to {username} ({len(formatted_msgs)} msgs)")
+
+
 # =============================================================================
 # Per-client thread
 # =============================================================================
@@ -327,23 +359,31 @@ def handle_search(data: dict, username: str):
 def handle_client(conn: socket.socket, addr, username: str):
     """
     Runs in its own daemon thread for each connected client.
-
-    Main loop: read one packet → dispatch to the appropriate handler → repeat.
-    On disconnect (or any unrecoverable error): clean up and exit.
+    Uses socket.makefile() for properly buffered, lossless line reading —
+    critical for large file payloads that span multiple TCP segments.
     """
     log.info(f"CONNECT  {username}  from  {addr[0]}:{addr[1]}")
     broadcast_system(f"{username} joined the chat")
     push_user_list()
 
+    # makefile gives us a buffered file-like object — readline() on it
+    # correctly handles multi-packet TCP chunks without losing data.
+    conn_file = conn.makefile('rb', buffering=65536)
+
     try:
         while True:
-            raw = receive_line(conn)
-
-            # Empty string → client closed the connection
-            if not raw:
+            try:
+                line = conn_file.readline()
+            except OSError:
                 break
 
-            # Parse the JSON envelope
+            if not line:
+                break
+
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
@@ -352,19 +392,18 @@ def handle_client(conn: socket.socket, addr, username: str):
 
             msg_type = data.get("type", "")
 
-            # ── Dispatch ──────────────────────────────────────────────────────
-            if   msg_type == "chat":    handle_chat(data, username)
-            elif msg_type == "file":    handle_file(data, username)
-            elif msg_type == "typing":  handle_typing(data, username)
-            elif msg_type == "status":  handle_status(data, username)
-            elif msg_type == "search":  handle_search(data, username)
-            # else: unknown type — ignore silently
+            if   msg_type == "chat":         handle_chat(data, username)
+            elif msg_type == "file":         handle_file(data, username)
+            elif msg_type == "typing":       handle_typing(data, username)
+            elif msg_type == "status":       handle_status(data, username)
+            elif msg_type == "search":       handle_search(data, username)
+            elif msg_type == "sync_history": handle_history_request(data, username)
 
     except Exception as e:
         log.error(f"Unhandled error in thread for {username}: {e}")
 
     finally:
-        # ── Cleanup ───────────────────────────────────────────────────────────
+        conn_file.close()
         with clients_lock:
             clients.pop(username, None)
         conn.close()

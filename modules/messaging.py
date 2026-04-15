@@ -164,3 +164,12 @@ def build_signup_ok_packet(username: str) -> dict:
         "body": f"Account created!  Welcome, {username}.",
         "time": now_display()
     }
+
+
+def build_history_packet(contact: str, messages: list) -> dict:
+    """Send back a batch of past messages to populate the UI on load."""
+    return {
+        "type": "history",
+        "contact": contact,
+        "messages": messages
+    }
