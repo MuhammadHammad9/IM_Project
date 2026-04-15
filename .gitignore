@@ -1,0 +1,39 @@
+# ─── Sensitive / runtime data (NEVER commit these) ───────────────────────────
+database.db
+database.db-shm
+database.db-wal
+server.log
+uploads/
+
+# ─── Python bytecode & cache ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ─── Virtual environments ─────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env
+*.env
+
+# ─── Node / frontend ──────────────────────────────────────────────────────────
+node_modules/
+web_client/dist/
+web_client/.vite/
+
+# ─── OS junk ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ─── Editor ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
