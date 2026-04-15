@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IM Project | Secure Instant Messaging</title>
+    <meta name="description" content="A powerful, secure, and fully-featured Instant Messaging server and client built in Python.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+
+    <nav class="navbar">
+        <div class="container nav-content">
+            <div class="logo">
+                <span class="logo-icon">💬</span> IM Project
+            </div>
+            <a href="https://github.com/MuhammadHammad9/IM_Project" target="_blank" class="btn btn-outline">Star on GitHub</a>
+        </div>
+    </nav>
+
+    <header class="hero container">
+        <div class="hero-text fade-in-up">
+            <h1 class="gradient-text">Instant Messaging,<br>Reimagined.</h1>
+            <p>A high-performance, multithreaded Python chat server and client featuring real-time typing indicators, read receipts, and native file sharing.</p>
+            <div class="hero-actions">
+                <a href="#features" class="btn btn-primary">Explore Features</a>
+                <a href="https://github.com/MuhammadHammad9/IM_Project" target="_blank" class="btn btn-secondary">View Source Code</a>
+            </div>
+        </div>
+        
+        <div class="hero-visual fade-in-up delay-1">
+            <div class="glass-card chat-mockup">
+                <div class="chat-header">
+                    <div class="window-controls">
+                        <span class="control red"></span>
+                        <span class="control yellow"></span>
+                        <span class="control green"></span>
+                    </div>
+                    <div class="chat-title">Chat with Alice</div>
+                </div>
+                <div class="chat-body">
+                    <div class="message msg-in">
+                        <div class="msg-content">Hey! Did you check out the new IM Project?</div>
+                        <div class="msg-time">10:42 AM</div>
+                    </div>
+                    <div class="message msg-out">
+                        <div class="msg-content">Yes, the new file sharing feature is amazing! 🚀</div>
+                        <div class="msg-status">✔️✔️</div>
+                    </div>
+                    <div class="message msg-in">
+                        <div class="typing-indicator">
+                            <span></span><span></span><span></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-footer">
+                    <input type="text" placeholder="Type a message..." disabled>
+                    <button class="send-btn">➔</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <section id="features" class="features section container">
+        <div class="section-title text-center fade-in-up">
+            <h2>Packed with Power</h2>
+            <p>Everything you need in a modern messaging application.</p>
+        </div>
+
+        <div class="feature-grid">
+            <div class="feature-card glass-card fade-in-up delay-1">
+                <div class="icon">🔒</div>
+                <h3>Secure Authentication</h3>
+                <p>Real signup and login flows with hashed passwords to keep user accounts secure.</p>
+            </div>
+            <div class="feature-card glass-card fade-in-up delay-2">
+                <div class="icon">💾</div>
+                <h3>SQLite Persistence</h3>
+                <p>Never lose a message. Everything from histories to file records is safely stored.</p>
+            </div>
+            <div class="feature-card glass-card fade-in-up delay-3">
+                <div class="icon">👀</div>
+                <h3>Real-time Status</h3>
+                <p>Live typing indicators and instant Delivered/Seen read receipts via sockets.</p>
+            </div>
+            <div class="feature-card glass-card fade-in-up delay-1">
+                <div class="icon">📎</div>
+                <h3>File Sharing</h3>
+                <p>Transfer documents and images seamlessly using Base64 binary encoding.</p>
+            </div>
+            <div class="feature-card glass-card fade-in-up delay-2">
+                <div class="icon">🔍</div>
+                <h3>Message Search</h3>
+                <p>Instantly find past conversations with the built-in full-text SQLite search engine.</p>
+            </div>
+            <div class="feature-card glass-card fade-in-up delay-3">
+                <div class="icon">⚡</div>
+                <h3>Multithreaded Backend</h3>
+                <p>A responsive, highly concurrent server handles dozens of continuous raw TCP connections.</p>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container text-center">
+            <p>Built by <strong>Muhammad Hammad</strong> | Open Sourced on GitHub</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
