@@ -36,7 +36,10 @@ import mimetypes
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-UPLOADS_DIR    = "uploads"
+# Absolute path so uploads/ is always created inside the project root,
+# regardless of which directory the user runs `python server.py` from.
+_MODULE_DIR    = os.path.dirname(os.path.abspath(__file__))
+UPLOADS_DIR    = os.path.join(_MODULE_DIR, '..', 'uploads')
 MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB
 
 

@@ -108,11 +108,11 @@ def build_typing_packet(sender: str, recipient: str) -> dict:
 def build_userlist_packet(users: list) -> dict:
     """
     Send the full list of currently-online users to all clients.
-    Clients use this to refresh their recipient dropdown.
+    `users` is now a list of profile dicts.
     """
     return {
         "type":  "userlist",
-        "users": sorted(users)
+        "users": users
     }
 
 
@@ -172,4 +172,64 @@ def build_history_packet(contact: str, messages: list) -> dict:
         "type": "history",
         "contact": contact,
         "messages": messages
+    }
+
+
+def build_reaction_packet(msg_id: str, username: str, emoji: str, action: str = "add") -> dict:
+    return {
+        "type": "reaction",
+        "msg_id": msg_id,
+        "username": username,
+        "emoji": emoji,
+        "action": action
+    }
+
+
+def build_profile_packet(profile: dict) -> dict:
+    return {
+        "type": "profile",
+        "profile": profile
+    }
+
+
+def build_admin_stats_packet(stats: dict) -> dict:
+    return {
+        "type": "admin_stats",
+        "stats": stats
+    }
+
+
+def build_pin_packet(msg_id: str, is_pinned: bool) -> dict:
+    return {
+        "type": "pin_update",
+        "msg_id": msg_id,
+        "is_pinned": is_pinned
+    }
+
+
+def build_voice_packet(sender: str, recipient: str, data_b64: str, msg_id: str = None) -> dict:
+    return {
+        "type": "voice",
+        "msg_id": msg_id or new_msg_id(),
+        "sender": sender,
+        "recipient": recipient,
+        "data": data_b64,
+        "time": now_display()
+    }
+
+
+def build_webrtc_packet(sender: str, recipient: str, signal: dict) -> dict:
+    return {
+        "type": "webrtc_signal",
+        "sender": sender,
+        "recipient": recipient,
+        "signal": signal
+    }
+
+
+def build_key_exchange_packet(username: str, public_key: str) -> dict:
+    return {
+        "type": "key_exchange",
+        "username": username,
+        "public_key": public_key
     }

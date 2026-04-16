@@ -54,10 +54,54 @@ from modules.messaging   import (
     build_chat_packet, build_system_packet, build_status_packet,
     build_typing_packet, build_userlist_packet, build_file_packet,
     build_search_results_packet, build_history_packet,
-    build_login_ok_packet, build_login_error_packet, build_signup_ok_packet
+    build_login_ok_packet, build_login_error_packet, build_signup_ok_packet,
+    build_reaction_packet, build_profile_packet, build_admin_stats_packet,
+    build_pin_packet, build_voice_packet, build_webrtc_packet,
+    build_key_exchange_packet
 )
 from modules.file_handler import save_file_from_b64, MAX_FILE_BYTES
 from modules.search       import search as do_search
+import time
+import urllib.request
+import urllib.error
+from html.parser import HTMLParser
+
+# ── In-memory link preview cache ──────────────────────────────────────────────
+_preview_cache: dict = {}  # url -> {title, description, image}
+
+
+class _OGParser(HTMLParser):
+    """Minimal Open Graph meta tag scraper."""
+    def __init__(self):
+        super().__init__()
+        self.og = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "meta":
+            a = dict(attrs)
+            prop = a.get("property", a.get("name", ""))
+            content = a.get("content", "")
+            if prop in ("og:title", "og:description", "og:image", "twitter:title", "twitter:description", "twitter:image"):
+                key = prop.split(":", 1)[1]  # "title", "description", "image"
+                if key not in self.og:
+                    self.og[key] = content
+
+
+def _fetch_link_preview(url: str) -> dict:
+    """Fetch and parse OG metadata from a URL, returning title/description/image."""
+    if url in _preview_cache:
+        return _preview_cache[url]
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (StitchIM LinkPreview/1.0)"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read(8192).decode("utf-8", errors="replace")
+        parser = _OGParser()
+        parser.feed(raw)
+        result = {"url": url, **parser.og}
+        _preview_cache[url] = result
+        return result
+    except Exception:
+        return {"url": url}
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -82,11 +126,16 @@ clients_lock        = threading.Lock()
 # Socket I/O helpers
 # =============================================================================
 
+AUTH_TIMEOUT_SECS = 30   # seconds to wait for a login/signup packet before closing the connection
+
 def receive_line(conn: socket.socket) -> str:
     """
     Thin wrapper kept for auth phase — in handle_client we use makefile()
     for proper buffering. This reads until newline, one byte at a time.
     Only used for the first (auth) packet.
+
+    The socket MUST have a timeout set before calling this to avoid
+    blocking the auth thread forever on idle proxy connections.
     """
     data = b""
     while True:
@@ -150,13 +199,20 @@ def broadcast_system(body: str):
 
 def push_user_list():
     """
-    Broadcast the current online-user list to all clients.
-    Called whenever someone joins or leaves so every client's
-    recipient dropdown stays current.
+    Broadcast the current online-user list with profile info to all clients.
     """
     with clients_lock:
-        online = list(clients.keys())
-    broadcast_to_all(build_userlist_packet(online))
+        online_names = list(clients.keys())
+    
+    user_profiles = []
+    for name in online_names:
+        prof = db.get_user_profile(name)
+        if prof:
+            user_profiles.append(prof)
+        else:
+            user_profiles.append({"username": name, "avatar": "", "bio": "", "is_admin": 0})
+            
+    broadcast_to_all(build_userlist_packet(user_profiles))
 
 
 # =============================================================================
@@ -176,8 +232,19 @@ def handle_chat(data: dict, username: str):
     """
     body      = data.get("body", "").strip()
     recipient = data.get("recipient", "ALL")
+    reply_to  = data.get("reply_to")  # optional: msg_id being replied to
 
     # ── Validation ────────────────────────────────────────────────────────────
+    if not db.get_user_profile(username):
+        log.warning(f"Ghost session detected for deleted user {username}. Terminating.")
+        with clients_lock:
+            if username in clients and clients[username] == conn:
+                clients[username].close()
+                del clients[username]
+            else:
+                conn.close()
+        return
+
     if not body:
         return
     if len(body) > MAX_MSG_CHARS:
@@ -193,9 +260,11 @@ def handle_chat(data: dict, username: str):
         body      = body,
         msg_id    = msg_id
     )
+    if reply_to:
+        packet["reply_to"] = reply_to
 
     # ── Persist to database ───────────────────────────────────────────────────
-    db.save_message(msg_id, username, recipient, body, now_timestamp())
+    db.save_message(msg_id, username, recipient, body, now_timestamp(), reply_to=reply_to)
     log.info(f"MSG  {username} → {recipient}: {body[:60]}")
 
     # ── Route ─────────────────────────────────────────────────────────────────
@@ -213,6 +282,40 @@ def handle_chat(data: dict, username: str):
         else:
             send_to_user(username, build_system_packet(
                 f"'{recipient}' is not online right now.  Your message was saved."))
+
+
+def handle_link_preview(data: dict, username: str):
+    """
+    Fetch Open Graph metadata for a URL and return it only to the requesting client.
+    """
+    url = data.get("url", "").strip()
+    if not url:
+        return
+    preview = _fetch_link_preview(url)
+    conn = None
+    with clients_lock:
+        conn = clients.get(username)
+    if conn:
+        send_packet(conn, {"type": "link_preview_result", **preview})
+
+
+def handle_edit(data: dict, username: str):
+    """
+    Route a message edit request.
+    """
+    msg_id    = data.get("msg_id")
+    new_body  = data.get("body", "").strip()
+    
+    if not msg_id or not new_body:
+        return
+        
+    if db.edit_message(msg_id, username, new_body):
+        # Successfully edited in DB, broadcast it to all or specific users
+        packet = {"type": "edit_message", "msg_id": msg_id, "body": new_body}
+        
+        # We need to dispatch it. For simplicity, broadcast to all. 
+        # (Clients will only update if they hold the original message)
+        broadcast_to_all(packet)
 
 
 def handle_file(data: dict, username: str):
@@ -257,8 +360,7 @@ def handle_file(data: dict, username: str):
         broadcast_to_all(packet)
     else:
         send_to_user(recipient, packet)
-        # Send a lightweight delivered status back to sender — NOT the full
-        # base64 payload, which caused proxy LimitOverrunError & disconnects.
+        send_to_user(username, packet)   # echo back to sender so their UI shows the sent file
         db.update_message_status(msg_id, "delivered")
         send_to_user(username, build_status_packet(msg_id, "delivered"))
 
@@ -325,31 +427,224 @@ def handle_history_request(data: dict, username: str):
     Fetch up to 50 messages for a given contact.
     If contact == "ALL", grabs global conversation.
     Otherwise, grabs direct messages between user and contact.
+    New users only see messages sent after they joined.
     """
     contact = data.get("contact", "")
     if not contact:
         return
 
+    # Get the user's join date so new users don't see old history
+    joined_at = db.get_joined_at(username)
+
     if contact == "ALL":
-        msgs = db.get_global_conversation(50)
+        msgs = db.get_global_conversation(50, after_ts=joined_at)
     else:
-        msgs = db.get_conversation(username, contact, 50)
+        msgs = db.get_conversation(username, contact, 50, after_ts=joined_at)
     
     # Format them cleanly before sending
     formatted_msgs = []
     for m in msgs:
+        ts = m.get("timestamp") or ""
         formatted_msgs.append({
             "id": m["msg_id"],
             "sender": m["sender"],
             "recipient": m["recipient"],
             "body": m["body"],
-            "time": m["timestamp"][11:16],  # extract HH:MM
-            "status": m["status"]
+            "time": ts[11:16] if len(ts) >= 16 else "",   # safe HH:MM slice
+            "status": m["status"],
+            "reply_to": m.get("reply_to"),
         })
 
     packet = build_history_packet(contact, formatted_msgs)
     send_to_user(username, packet)
     log.info(f"HISTORY served for {contact} to {username} ({len(formatted_msgs)} msgs)")
+
+
+def handle_reaction(data: dict, username: str):
+    msg_id = data.get("msg_id")
+    emoji  = data.get("emoji")
+    action = data.get("action", "add")
+    if not msg_id or not emoji: return
+
+    if action == "add":
+        db.add_reaction(msg_id, username, emoji)
+    else:
+        db.remove_reaction(msg_id, username)
+
+    # Broadcast to recipients
+    msg = db.get_message(msg_id)
+    if msg:
+        packet = build_reaction_packet(msg_id, username, emoji, action)
+        if msg["recipient"] == "ALL":
+            broadcast_to_all(packet)
+        else:
+            send_to_user(msg["sender"], packet)
+            send_to_user(msg["recipient"], packet)
+
+
+def handle_profile_update(data: dict, username: str):
+    bio = data.get("bio")
+    avatar = data.get("avatar")
+    public_key = data.get("public_key")
+    presence = data.get("presence")
+    status_text = data.get("status_text")
+    
+    kwargs = {}
+    if presence is not None: kwargs["presence"] = presence
+    if status_text is not None: kwargs["status_text"] = status_text
+    
+    db.update_profile(username, bio, avatar, public_key, **kwargs)
+    
+    # Notify user that profile is updated
+    send_to_user(username, build_profile_packet(db.get_user_profile(username)))
+    # Because presence is public to all users, push user list if presence changed
+    if presence is not None or status_text is not None:
+        push_user_list()
+
+
+def handle_pin(data: dict, username: str):
+    msg_id = data.get("msg_id")
+    if not msg_id: return
+    db.toggle_pin(msg_id)
+    msg = db.get_message(msg_id)
+    if msg:
+        packet = build_pin_packet(msg_id, bool(msg["is_pinned"]))
+        if msg["recipient"] == "ALL":
+            broadcast_to_all(packet)
+        else:
+            send_to_user(msg["sender"], packet)
+            send_to_user(msg["recipient"], packet)
+
+
+def handle_admin_stats(username: str):
+    profile = db.get_user_profile(username)
+    if profile and profile.get("is_admin"):
+        stats = db.get_admin_stats()
+        send_to_user(username, build_admin_stats_packet(stats))
+
+def handle_admin_action(data: dict, username: str):
+    """
+    Handle administrative destructive or management actions.
+    Must verify admin status before executing.
+    """
+    profile = db.get_user_profile(username)
+    if not profile or not profile.get("is_admin"):
+        send_to_user(username, build_system_packet("Permission denied: Admin only."))
+        return
+
+    action = data.get("action")
+    target = data.get("target")
+
+    if action == "delete_user":
+        if target == username:
+            send_to_user(username, build_system_packet("Error: You cannot delete yourself."))
+            return
+        
+        try:
+            db.delete_user(target)
+            log.info(f"ADMIN {username} deleted user {target}")
+            
+            # If the target is online, kick them
+            with clients_lock:
+                if target in clients:
+                    target_sock = clients[target]
+                    try:
+                        send_packet(target_sock, build_system_packet("Your account has been deleted by an administrator."))
+                        target_sock.close()
+                    except Exception as e:
+                        log.warning(f"Error kicking deleted user: {e}")
+            
+            # Refresh stats for the admin
+            handle_admin_stats(username)
+            # Notify globally about the user leaving
+            broadcast_system(f"Account '{target}' has been removed from the platform.")
+            push_user_list()
+            send_to_user(username, build_system_packet(f"Successfully deleted user: {target}"))
+        except Exception as e:
+            err_msg = f"Failed to delete {target}. Backend error: {e}"
+            log.error(err_msg)
+            send_to_user(username, build_system_packet(err_msg))
+
+    elif action == "broadcast":
+        body = data.get("body", "")
+        if body:
+            log.info(f"ADMIN {username} broadcasted: {body}")
+            broadcast_to_all(build_system_packet(f"📣 ADMIN ANNOUNCEMENT: {body}"))
+
+
+def handle_voice(data: dict, username: str):
+    recipient = data.get("recipient", "ALL")
+    data_b64 = data.get("data")
+    if not data_b64: return
+    msg_id = new_msg_id()
+    # Save as file too for persistence
+    db.save_message(msg_id, username, recipient, "[Voice Message]", now_timestamp())
+    packet = build_voice_packet(username, recipient, data_b64, msg_id)
+    if recipient == "ALL":
+        broadcast_to_all(packet)
+    else:
+        send_to_user(recipient, packet)
+        send_to_user(username, build_status_packet(msg_id, "delivered"))
+
+
+def handle_webrtc(data: dict, username: str):
+    recipient = data.get("recipient")
+    signal = data.get("signal")
+    if not recipient or not signal: return
+    send_to_user(recipient, build_webrtc_packet(username, recipient, signal))
+
+
+def handle_schedule(data: dict, username: str):
+    """Save a message with a future scheduled_at timestamp."""
+    body         = data.get("body", "").strip()
+    recipient    = data.get("recipient", "ALL")
+    scheduled_at = data.get("scheduled_at")  # ISO string e.g. '2024-12-31T18:00'
+    reply_to     = data.get("reply_to")
+    if not body or not scheduled_at:
+        return
+    msg_id = new_msg_id()
+    db.save_message(msg_id, username, recipient, body, now_timestamp(),
+                    reply_to=reply_to, scheduled_at=scheduled_at)
+    # Confirm to sender that it was scheduled
+    send_to_user(username, build_system_packet(
+        f"⏰ Message scheduled for {scheduled_at}: \"{body[:40]}\""))
+
+
+def scheduled_flush_loop():
+    """Background thread: every 30 s dispatch any due scheduled messages."""
+    while True:
+        try:
+            now_str = time.strftime('%Y-%m-%dT%H:%M', time.localtime())
+            due = db.get_due_scheduled_messages(now_str)
+            for msg in due:
+                packet = build_chat_packet(
+                    sender=msg['sender'],
+                    recipient=msg['recipient'],
+                    body=msg['body'],
+                    msg_id=msg['msg_id']
+                )
+                if msg['reply_to']:
+                    packet['reply_to'] = msg['reply_to']
+                if msg['recipient'] == 'ALL':
+                    broadcast_to_all(packet)
+                else:
+                    send_to_user(msg['recipient'], packet)
+                    send_to_user(msg['sender'], packet)
+                db.mark_scheduled_dispatched(msg['msg_id'])
+                log.info(f"SCHEDULED dispatch: {msg['sender']} → {msg['recipient']}: {msg['body'][:40]}")
+        except Exception as e:
+            log.error(f"scheduled_flush_loop error: {e}")
+        time.sleep(30)
+
+
+
+def handle_key_exchange(data: dict, username: str):
+    public_key = data.get("public_key")
+    if not public_key: return
+    db.update_profile(username, public_key=public_key)
+    # When a key is updated, we could broadcast it, or let others fetch it.
+    # For now, we'll let others fetch it via user profiles or just send it to current chats.
+    broadcast_to_all(build_key_exchange_packet(username, public_key))
 
 
 # =============================================================================
@@ -370,6 +665,12 @@ def handle_client(conn: socket.socket, addr, username: str):
     # correctly handles multi-packet TCP chunks without losing data.
     conn_file = conn.makefile('rb', buffering=65536)
 
+    import time
+    RATE_LIMIT_MSGS = 50
+    RATE_LIMIT_WINDOW = 1.0
+    msg_count = 0
+    window_start = time.time()
+
     try:
         while True:
             try:
@@ -383,6 +684,17 @@ def handle_client(conn: socket.socket, addr, username: str):
             raw = line.decode("utf-8", errors="replace").strip()
             if not raw:
                 continue
+
+            # Rate Limiting Logic
+            now = time.time()
+            if now - window_start > RATE_LIMIT_WINDOW:
+                msg_count = 0
+                window_start = now
+            msg_count += 1
+            if msg_count > RATE_LIMIT_MSGS:
+                log.warning(f"Rate Limiting triggered for {username}")
+                send_packet(conn, build_system_packet("You are sending messages too fast. Connection closed."))
+                break
 
             try:
                 data = json.loads(raw)
@@ -398,6 +710,17 @@ def handle_client(conn: socket.socket, addr, username: str):
             elif msg_type == "status":       handle_status(data, username)
             elif msg_type == "search":       handle_search(data, username)
             elif msg_type == "sync_history": handle_history_request(data, username)
+            elif msg_type == "reaction":     handle_reaction(data, username)
+            elif msg_type == "profile_upd":  handle_profile_update(data, username)
+            elif msg_type == "pin":          handle_pin(data, username)
+            elif msg_type == "admin_stats":  handle_admin_stats(username)
+            elif msg_type == "admin_action": handle_admin_action(data, username)
+            elif msg_type == "voice":         handle_voice(data, username)
+            elif msg_type == "webrtc":       handle_webrtc(data, username)
+            elif msg_type == "key_exchange": handle_key_exchange(data, username)
+            elif msg_type == "schedule":     handle_schedule(data, username)
+            elif msg_type == "edit":         handle_edit(data, username)
+            elif msg_type == "link_preview": handle_link_preview(data, username)
 
     except Exception as e:
         log.error(f"Unhandled error in thread for {username}: {e}")
@@ -500,6 +823,61 @@ def do_login_or_signup(conn: socket.socket) -> str | None:
 
 
 # =============================================================================
+# Per-connection auth thread  (fixes the accept-loop blocking bug)
+# =============================================================================
+
+def auth_and_launch(conn: socket.socket, addr):
+    """
+    Runs in its own daemon thread for EACH incoming TCP connection.
+
+    WHY THIS EXISTS (critical bug fix):
+    -----------------------------------
+    The old code called do_login_or_signup() directly in the accept loop.
+    do_login_or_signup() calls receive_line() which does a BLOCKING socket
+    read — waiting for the client to send the first packet.
+
+    Because the WebSocket proxy opens a new TCP connection for every WS
+    client (including idle reconnects from the browser), the accept loop
+    was permanently stuck waiting for a login packet on the first idle
+    connection.  No further TCP connections could be processed, so actual
+    login attempts were silently queued and never handled.
+
+    The fix: every accepted connection gets its own auth thread.  The
+    accept loop returns to accept() immediately, so many connections can
+    authenticate concurrently without blocking each other.
+
+    A socket timeout is set so that idle connections that never send a
+    login packet are cleaned up after AUTH_TIMEOUT_SECS seconds.
+    """
+    # Set a timeout so idle proxy connections don't hang this thread forever
+    conn.settimeout(AUTH_TIMEOUT_SECS)
+
+    try:
+        username = do_login_or_signup(conn)
+    except Exception as e:
+        log.warning(f"Auth error from {addr}: {e}")
+        username = None
+    finally:
+        # Remove the timeout — the client thread uses blocking I/O again
+        conn.settimeout(None)
+
+    if username is None:
+        conn.close()
+        return
+
+    # Register and launch the main client thread
+    with clients_lock:
+        clients[username] = conn
+
+    t = threading.Thread(
+        target=handle_client,
+        args=(conn, addr, username),
+        daemon=True
+    )
+    t.start()
+
+
+# =============================================================================
 # Main accept loop
 # =============================================================================
 
@@ -507,7 +885,7 @@ def start_server():
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((HOST, PORT))
-    server_sock.listen(20)
+    server_sock.listen(50)   # increased backlog to handle burst connections from the proxy
 
     log.info("=" * 52)
     log.info(f"  IM Server started  —  listening on port {PORT}")
@@ -524,19 +902,10 @@ def start_server():
             except OSError:
                 break   # server socket was closed (Ctrl+C)
 
-            # ── Authentication ────────────────────────────────────────────────
-            username = do_login_or_signup(conn)
-            if username is None:
-                conn.close()
-                continue
-
-            # ── Register and spawn thread ─────────────────────────────────────
-            with clients_lock:
-                clients[username] = conn
-
+            # ── Spawn auth thread immediately so the accept loop stays free ───
             t = threading.Thread(
-                target=handle_client,
-                args=(conn, addr, username),
+                target=auth_and_launch,
+                args=(conn, addr),
                 daemon=True
             )
             t.start()
@@ -554,4 +923,7 @@ def start_server():
 # =============================================================================
 
 if __name__ == "__main__":
+    # Start the scheduled message flush background thread
+    sched_thread = threading.Thread(target=scheduled_flush_loop, daemon=True)
+    sched_thread.start()
     start_server()
