@@ -45,6 +45,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import socket
 import threading
 import json
+import re
+import base64
+import urllib.parse
 
 from modules.logger      import get_logger
 from modules.db          import Database
@@ -66,8 +69,12 @@ import urllib.request
 import urllib.error
 from html.parser import HTMLParser
 
+# Compiled regex for username validation (letters, digits, underscore, hyphen)
+_USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
 # ── In-memory link preview cache ──────────────────────────────────────────────
 _preview_cache: dict = {}  # url -> {title, description, image}
+_preview_cache_lock = threading.Lock()
 
 
 class _OGParser(HTMLParser):
@@ -104,7 +111,7 @@ DISALLOWED_HOSTNAMES = {'localhost', 'localhost.'}
 # fc00::/7  → ULA (unique local addresses, private IPv6 equivalent)
 # fe80::/10 → link-local
 # ::1       → loopback
-DISALLOWED_IPV6_PREFIXES = ('::1', 'fc00:', 'fd', 'fe80:')
+DISALLOWED_IPV6_PREFIXES = ('::1', 'fc00:', 'fd00:', 'fe80:')
 
 # Maximum number of URLs to keep in the in-memory preview cache
 _PREVIEW_CACHE_MAX = 500
@@ -122,17 +129,34 @@ def _is_internal_ip(ip: str) -> bool:
             return True
     return False
 
+
+def _check_url_hostname(hostname: str) -> str | None:
+    """
+    Validate that `hostname` does not point to an internal address.
+    Returns an error string if blocked, or None if allowed.
+    """
+    hostname = hostname.lower()
+    if hostname in DISALLOWED_HOSTNAMES:
+        return "URL points to internal network"
+    if _is_internal_ip(hostname):
+        return "URL points to internal network"
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return "Could not resolve hostname"
+    for info in addr_infos:
+        if _is_internal_ip(info[4][0]):
+            return "URL resolves to internal network"
+    return None
+
+
 def _fetch_link_preview(url: str) -> dict:
     """Fetch OG metadata with security checks against SSRF and DoS."""
-    if url in _preview_cache:
-        return _preview_cache[url]
-
-    # Evict oldest entry when the cache is full to bound memory usage
-    if len(_preview_cache) >= _PREVIEW_CACHE_MAX:
-        _preview_cache.pop(next(iter(_preview_cache)))
+    with _preview_cache_lock:
+        if url in _preview_cache:
+            return _preview_cache[url]
 
     try:
-        import urllib.parse, socket as _socket
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ('http', 'https'):
             return {"url": url, "error": "Invalid URL scheme"}
@@ -140,28 +164,14 @@ def _fetch_link_preview(url: str) -> dict:
         if len(url) > 2048:
             return {"url": url, "error": "URL too long"}
 
-        hostname = (parsed.hostname or "").lower()
+        hostname = parsed.hostname or ""
         if not hostname:
             return {"url": url, "error": "Missing hostname"}
 
-        # Block known internal hostnames
-        if hostname in DISALLOWED_HOSTNAMES:
-            return {"url": url, "error": "URL points to internal network"}
-
-        # Block based on literal hostname/IP string
-        if _is_internal_ip(hostname):
-            return {"url": url, "error": "URL points to internal network"}
-
-        # Resolve hostname to all addresses (IPv4 + IPv6) and verify none are
-        # internal — this guards against DNS-rebinding attacks.
-        try:
-            addr_infos = _socket.getaddrinfo(hostname, None)
-        except _socket.gaierror:
-            return {"url": url, "error": "Could not resolve hostname"}
-        for info in addr_infos:
-            resolved_ip = info[4][0]
-            if _is_internal_ip(resolved_ip):
-                return {"url": url, "error": "URL resolves to internal network"}
+        # Block based on literal hostname/IP string and DNS resolution
+        err = _check_url_hostname(hostname)
+        if err:
+            return {"url": url, "error": err}
 
         # NOTE: timeout= belongs on urlopen(), NOT on Request()
         req = urllib.request.Request(
@@ -184,7 +194,11 @@ def _fetch_link_preview(url: str) -> dict:
         parser = _OGParser()
         parser.feed(html[:50000])  # Only parse first 50 KB to protect parser
         result = {"url": url, **parser.og}
-        _preview_cache[url] = result
+        with _preview_cache_lock:
+            # Evict oldest entry when the cache is full to bound memory usage
+            if len(_preview_cache) >= _PREVIEW_CACHE_MAX:
+                _preview_cache.pop(next(iter(_preview_cache)))
+            _preview_cache[url] = result
         return result
     except Exception as e:
         log.warning(f"Link preview fetch failed for {url}: {e}")
@@ -424,7 +438,6 @@ def handle_file(data: dict, username: str):
     recipient = data.get("recipient", "ALL")
 
     # ── Size check ────────────────────────────────────────────────────────────
-    import base64
     try:
         decoded_size = len(base64.b64decode(b64_data, validate=True))
         if decoded_size > MAX_FILE_BYTES:
@@ -584,11 +597,18 @@ def handle_profile_update(data: dict, username: str):
     presence = data.get("presence")
     status_text = data.get("status_text")
 
-    # Validate avatar URL: must be empty or an http/https URL (case-insensitive scheme)
-    if avatar is not None:
-        if avatar != "" and not avatar.lower().startswith(("http://", "https://")):
+    # Validate avatar URL: must be empty or an http/https URL pointing to an
+    # external host (prevents javascript: URIs and server-side request forgery).
+    if avatar is not None and avatar != "":
+        if not avatar.lower().startswith(("http://", "https://")):
             send_to_user(username, build_system_packet("Invalid avatar URL. Must be an http/https URL."))
-            avatar = None  # ignore the invalid value
+            avatar = None
+        else:
+            parsed_av = urllib.parse.urlparse(avatar)
+            av_hostname = parsed_av.hostname or ""
+            if av_hostname and _check_url_hostname(av_hostname) is not None:
+                send_to_user(username, build_system_packet("Avatar URL points to an internal address."))
+                avatar = None
     
     kwargs = {}
     if presence is not None: kwargs["presence"] = presence
@@ -680,9 +700,8 @@ def handle_voice(data: dict, username: str):
     if not data_b64: return
 
     # Validate size of voice data (same limit as regular files)
-    import base64 as _b64
     try:
-        decoded_size = len(_b64.b64decode(data_b64, validate=True))
+        decoded_size = len(base64.b64decode(data_b64, validate=True))
         if decoded_size > MAX_FILE_BYTES:
             send_to_user(username, build_system_packet(
                 f"Voice message too large. Limit is {MAX_FILE_BYTES // (1024*1024)} MB."))
@@ -887,8 +906,7 @@ def do_login_or_signup(conn: socket.socket) -> str | None:
         send_packet(conn, build_login_error_packet(
             f"Username too long.  Maximum is {MAX_USERNAME_LEN} characters."))
         return None
-    import re as _re
-    if not _re.fullmatch(r'[A-Za-z0-9_-]+', username):
+    if not _USERNAME_RE.match(username):
         send_packet(conn, build_login_error_packet(
             "Username may only contain letters, digits, underscores and hyphens."))
         return None
