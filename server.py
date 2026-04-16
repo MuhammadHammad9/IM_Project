@@ -100,20 +100,23 @@ DISALLOWED_IP_PREFIXES = [
 ]
 DISALLOWED_HOSTNAMES = {'localhost', 'localhost.'}
 
-# IPv6 prefixes / addresses to block (lowercase)
-DISALLOWED_IPV6_PREFIXES = ('::1', '::', 'fc', 'fd', 'fe80')
+# IPv6 prefixes to block (lowercase, colon-terminated for precise matching).
+# fc00::/7  → ULA (unique local addresses, private IPv6 equivalent)
+# fe80::/10 → link-local
+# ::1       → loopback
+DISALLOWED_IPV6_PREFIXES = ('::1', 'fc00:', 'fd', 'fe80:')
 
 # Maximum number of URLs to keep in the in-memory preview cache
 _PREVIEW_CACHE_MAX = 500
 
 def _is_internal_ip(ip: str) -> bool:
-    """Return True if `ip` resolves to an internal / reserved address."""
+    """Return True if `ip` is an internal / reserved address."""
     ip_lower = ip.lower().strip('[]')
-    if ip_lower in ('::1', '::'):
-        return True
+    # IPv6 loopback and ULA/link-local
     for prefix in DISALLOWED_IPV6_PREFIXES:
         if ip_lower.startswith(prefix):
             return True
+    # IPv4 reserved ranges
     for prefix in DISALLOWED_IP_PREFIXES:
         if ip.startswith(prefix):
             return True
@@ -124,12 +127,9 @@ def _fetch_link_preview(url: str) -> dict:
     if url in _preview_cache:
         return _preview_cache[url]
 
-    # Evict oldest entry when the cache is full
+    # Evict oldest entry when the cache is full to bound memory usage
     if len(_preview_cache) >= _PREVIEW_CACHE_MAX:
-        try:
-            _preview_cache.pop(next(iter(_preview_cache)))
-        except StopIteration:
-            pass
+        _preview_cache.pop(next(iter(_preview_cache)))
 
     try:
         import urllib.parse, socket as _socket
@@ -152,14 +152,16 @@ def _fetch_link_preview(url: str) -> dict:
         if _is_internal_ip(hostname):
             return {"url": url, "error": "URL points to internal network"}
 
-        # Resolve hostname and verify the resulting IP is not internal
-        # (guards against DNS rebinding attacks)
+        # Resolve hostname to all addresses (IPv4 + IPv6) and verify none are
+        # internal — this guards against DNS-rebinding attacks.
         try:
-            resolved_ip = _socket.gethostbyname(hostname)
+            addr_infos = _socket.getaddrinfo(hostname, None)
         except _socket.gaierror:
             return {"url": url, "error": "Could not resolve hostname"}
-        if _is_internal_ip(resolved_ip):
-            return {"url": url, "error": "URL resolves to internal network"}
+        for info in addr_infos:
+            resolved_ip = info[4][0]
+            if _is_internal_ip(resolved_ip):
+                return {"url": url, "error": "URL resolves to internal network"}
 
         # NOTE: timeout= belongs on urlopen(), NOT on Request()
         req = urllib.request.Request(
@@ -582,9 +584,9 @@ def handle_profile_update(data: dict, username: str):
     presence = data.get("presence")
     status_text = data.get("status_text")
 
-    # Validate avatar URL: must be empty or an http/https URL
+    # Validate avatar URL: must be empty or an http/https URL (case-insensitive scheme)
     if avatar is not None:
-        if avatar != "" and not (avatar.startswith("http://") or avatar.startswith("https://")):
+        if avatar != "" and not avatar.lower().startswith(("http://", "https://")):
             send_to_user(username, build_system_packet("Invalid avatar URL. Must be an http/https URL."))
             avatar = None  # ignore the invalid value
     
@@ -886,7 +888,7 @@ def do_login_or_signup(conn: socket.socket) -> str | None:
             f"Username too long.  Maximum is {MAX_USERNAME_LEN} characters."))
         return None
     import re as _re
-    if not _re.fullmatch(r'[A-Za-z0-9_\-]+', username):
+    if not _re.fullmatch(r'[A-Za-z0-9_-]+', username):
         send_packet(conn, build_login_error_packet(
             "Username may only contain letters, digits, underscores and hyphens."))
         return None
