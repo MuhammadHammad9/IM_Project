@@ -87,38 +87,88 @@ class _OGParser(HTMLParser):
                     self.og[key] = content
 
 
-DISALLOWED_IPS = [
-    '127.0.0.1', 'localhost', '0.0.0.0',
-    '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.',
+DISALLOWED_IP_PREFIXES = [
+    '127.',        # loopback (covers 127.0.0.1 – 127.255.255.255)
+    '0.',          # 0.0.0.0/8 reserved
+    '10.',         # RFC 1918 private
+    '172.16.', '172.17.', '172.18.', '172.19.', '172.20.',
     '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.',
     '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
-    '192.168.',
+    '192.168.',    # RFC 1918 private
+    '169.254.',    # link-local
+    '100.64.',     # Shared Address Space (RFC 6598)
 ]
+DISALLOWED_HOSTNAMES = {'localhost', 'localhost.'}
+
+# IPv6 prefixes / addresses to block (lowercase)
+DISALLOWED_IPV6_PREFIXES = ('::1', '::', 'fc', 'fd', 'fe80')
+
+# Maximum number of URLs to keep in the in-memory preview cache
+_PREVIEW_CACHE_MAX = 500
+
+def _is_internal_ip(ip: str) -> bool:
+    """Return True if `ip` resolves to an internal / reserved address."""
+    ip_lower = ip.lower().strip('[]')
+    if ip_lower in ('::1', '::'):
+        return True
+    for prefix in DISALLOWED_IPV6_PREFIXES:
+        if ip_lower.startswith(prefix):
+            return True
+    for prefix in DISALLOWED_IP_PREFIXES:
+        if ip.startswith(prefix):
+            return True
+    return False
 
 def _fetch_link_preview(url: str) -> dict:
     """Fetch OG metadata with security checks against SSRF and DoS."""
     if url in _preview_cache:
         return _preview_cache[url]
-    
+
+    # Evict oldest entry when the cache is full
+    if len(_preview_cache) >= _PREVIEW_CACHE_MAX:
+        try:
+            _preview_cache.pop(next(iter(_preview_cache)))
+        except StopIteration:
+            pass
+
     try:
-        import urllib.parse
+        import urllib.parse, socket as _socket
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ('http', 'https'):
             return {"url": url, "error": "Invalid URL scheme"}
-            
-        hostname = parsed.hostname or ""
-        for blocked_prefix in DISALLOWED_IPS:
-            if hostname.startswith(blocked_prefix) or hostname == blocked_prefix.rstrip('.'):
-                return {"url": url, "error": "URL points to internal network"}
-                
+
+        if len(url) > 2048:
+            return {"url": url, "error": "URL too long"}
+
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return {"url": url, "error": "Missing hostname"}
+
+        # Block known internal hostnames
+        if hostname in DISALLOWED_HOSTNAMES:
+            return {"url": url, "error": "URL points to internal network"}
+
+        # Block based on literal hostname/IP string
+        if _is_internal_ip(hostname):
+            return {"url": url, "error": "URL points to internal network"}
+
+        # Resolve hostname and verify the resulting IP is not internal
+        # (guards against DNS rebinding attacks)
+        try:
+            resolved_ip = _socket.gethostbyname(hostname)
+        except _socket.gaierror:
+            return {"url": url, "error": "Could not resolve hostname"}
+        if _is_internal_ip(resolved_ip):
+            return {"url": url, "error": "URL resolves to internal network"}
+
+        # NOTE: timeout= belongs on urlopen(), NOT on Request()
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (StitchIM LinkPreview/1.0)"},
-            timeout=5
         )
-        
+
         with urllib.request.urlopen(req, timeout=5) as resp:
-            # Enforce max response size (approx 1 MB) to avoid DoS
+            # Enforce max response size (~1 MB) to avoid DoS
             raw = b""
             chunk_size = 8192
             for _ in range(128):
@@ -126,11 +176,11 @@ def _fetch_link_preview(url: str) -> dict:
                 if not chunk:
                     break
                 raw += chunk
-            
+
             html = raw.decode("utf-8", errors="replace")
-            
+
         parser = _OGParser()
-        parser.feed(html[:50000])  # Only parse first 50KB to protect parser
+        parser.feed(html[:50000])  # Only parse first 50 KB to protect parser
         result = {"url": url, **parser.og}
         _preview_cache[url] = result
         return result
@@ -273,11 +323,12 @@ def handle_chat(data: dict, username: str):
     if not db.get_user_profile(username):
         log.warning(f"Ghost session detected for deleted user {username}. Terminating.")
         with clients_lock:
-            if username in clients and clients[username] == conn:
-                clients[username].close()
-                del clients[username]
-            else:
-                conn.close()
+            sock = clients.pop(username, None)
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
         return
 
     if not body or len(body.strip()) == 0:
@@ -530,6 +581,12 @@ def handle_profile_update(data: dict, username: str):
     public_key = data.get("public_key")
     presence = data.get("presence")
     status_text = data.get("status_text")
+
+    # Validate avatar URL: must be empty or an http/https URL
+    if avatar is not None:
+        if avatar != "" and not (avatar.startswith("http://") or avatar.startswith("https://")):
+            send_to_user(username, build_system_packet("Invalid avatar URL. Must be an http/https URL."))
+            avatar = None  # ignore the invalid value
     
     kwargs = {}
     if presence is not None: kwargs["presence"] = presence
@@ -619,6 +676,19 @@ def handle_voice(data: dict, username: str):
     recipient = data.get("recipient", "ALL")
     data_b64 = data.get("data")
     if not data_b64: return
+
+    # Validate size of voice data (same limit as regular files)
+    import base64 as _b64
+    try:
+        decoded_size = len(_b64.b64decode(data_b64, validate=True))
+        if decoded_size > MAX_FILE_BYTES:
+            send_to_user(username, build_system_packet(
+                f"Voice message too large. Limit is {MAX_FILE_BYTES // (1024*1024)} MB."))
+            return
+    except Exception:
+        send_to_user(username, build_system_packet("Invalid voice data."))
+        return
+
     msg_id = new_msg_id()
     # Save as file too for persistence
     db.save_message(msg_id, username, recipient, "[Voice Message]", now_timestamp())
@@ -815,12 +885,14 @@ def do_login_or_signup(conn: socket.socket) -> str | None:
         send_packet(conn, build_login_error_packet(
             f"Username too long.  Maximum is {MAX_USERNAME_LEN} characters."))
         return None
-    if " " in username:
-        send_packet(conn, build_login_error_packet("Username cannot contain spaces."))
-        return None
-    if len(password) < 4:
+    import re as _re
+    if not _re.fullmatch(r'[A-Za-z0-9_\-]+', username):
         send_packet(conn, build_login_error_packet(
-            "Password must be at least 4 characters."))
+            "Username may only contain letters, digits, underscores and hyphens."))
+        return None
+    if len(password) < 8:
+        send_packet(conn, build_login_error_packet(
+            "Password must be at least 8 characters."))
         return None
 
     # ── Check if already logged in ────────────────────────────────────────────

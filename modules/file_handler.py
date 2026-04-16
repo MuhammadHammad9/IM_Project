@@ -97,6 +97,12 @@ def save_file_from_b64(msg_id: str, filename: str, b64_data: str) -> str:
     if not safe_name or len(safe_name) > 255:
         safe_name = "file"
 
+    # Reject SVG files — they can contain embedded JavaScript that executes
+    # in the browser when the file is opened as a data: URL or served directly.
+    _ext = safe_name.rsplit('.', 1)[-1].lower() if '.' in safe_name else ''
+    if _ext == 'svg':
+        raise ValueError("SVG files are not allowed for security reasons.")
+
     # Prefix with msg_id so two people can send files with the same name
     stored_name = f"{msg_id[:8]}_{safe_name}"
     full_path   = os.path.join(UPLOADS_DIR, stored_name)
