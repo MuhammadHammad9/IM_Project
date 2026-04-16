@@ -87,20 +87,55 @@ class _OGParser(HTMLParser):
                     self.og[key] = content
 
 
+DISALLOWED_IPS = [
+    '127.0.0.1', 'localhost', '0.0.0.0',
+    '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.',
+    '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.',
+    '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
+    '192.168.',
+]
+
 def _fetch_link_preview(url: str) -> dict:
-    """Fetch and parse OG metadata from a URL, returning title/description/image."""
+    """Fetch OG metadata with security checks against SSRF and DoS."""
     if url in _preview_cache:
         return _preview_cache[url]
+    
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (StitchIM LinkPreview/1.0)"})
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return {"url": url, "error": "Invalid URL scheme"}
+            
+        hostname = parsed.hostname or ""
+        for blocked_prefix in DISALLOWED_IPS:
+            if hostname.startswith(blocked_prefix) or hostname == blocked_prefix.rstrip('.'):
+                return {"url": url, "error": "URL points to internal network"}
+                
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (StitchIM LinkPreview/1.0)"},
+            timeout=5
+        )
+        
         with urllib.request.urlopen(req, timeout=5) as resp:
-            raw = resp.read(8192).decode("utf-8", errors="replace")
+            # Enforce max response size (approx 1 MB) to avoid DoS
+            raw = b""
+            chunk_size = 8192
+            for _ in range(128):
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                raw += chunk
+            
+            html = raw.decode("utf-8", errors="replace")
+            
         parser = _OGParser()
-        parser.feed(raw)
+        parser.feed(html[:50000])  # Only parse first 50KB to protect parser
         result = {"url": url, **parser.og}
         _preview_cache[url] = result
         return result
-    except Exception:
+    except Exception as e:
+        log.warning(f"Link preview fetch failed for {url}: {e}")
         return {"url": url}
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -245,12 +280,16 @@ def handle_chat(data: dict, username: str):
                 conn.close()
         return
 
-    if not body:
+    if not body or len(body.strip()) == 0:
+        send_to_user(username, build_system_packet("Message cannot be empty"))
         return
     if len(body) > MAX_MSG_CHARS:
-        send_to_user(username, build_system_packet(
-            f"Message too long ({len(body)} chars).  Limit is {MAX_MSG_CHARS}."))
+        send_to_user(username, build_system_packet(f"Message too long. Max {MAX_MSG_CHARS} characters."))
         return
+    if '\x00' in body:
+        send_to_user(username, build_system_packet("Message contains invalid characters"))
+        return
+    body = body.strip()
 
     # ── Build the canonical packet (server stamps the time and ID) ────────────
     msg_id = new_msg_id()
@@ -332,12 +371,15 @@ def handle_file(data: dict, username: str):
     recipient = data.get("recipient", "ALL")
 
     # ── Size check ────────────────────────────────────────────────────────────
-    # base64 expands size by ~33%, so the encoded string can be at most
-    # (MAX_FILE_BYTES * 4/3) chars.
-    max_b64_len = int(MAX_FILE_BYTES * 1.35)
-    if len(b64_data) > max_b64_len:
-        send_to_user(username, build_system_packet(
-            f"File too large.  Limit is {MAX_FILE_BYTES // (1024*1024)} MB."))
+    import base64
+    try:
+        decoded_size = len(base64.b64decode(b64_data, validate=True))
+        if decoded_size > MAX_FILE_BYTES:
+            send_to_user(username, build_system_packet(
+                f"File too large. Limit is {MAX_FILE_BYTES // (1024*1024)} MB."))
+            return
+    except Exception:
+        send_to_user(username, build_system_packet("Invalid file data."))
         return
 
     # ── Save to uploads/ ──────────────────────────────────────────────────────
@@ -541,6 +583,7 @@ def handle_admin_action(data: dict, username: str):
             return
         
         try:
+            db.log_admin_action(username, "delete_user", target)
             db.delete_user(target)
             log.info(f"ADMIN {username} deleted user {target}")
             
@@ -791,15 +834,23 @@ def do_login_or_signup(conn: socket.socket) -> str | None:
 
     # ── Login ──────────────────────────────────────────────────────────────────
     if auth_type == "login":
+        if db.get_recent_failed_logins(username, 15) > 5:
+            send_packet(conn, build_login_error_packet("Too many failed attempts. Try again in 15 minutes."))
+            return None
+
         stored_hash = db.get_password_hash(username)
         if stored_hash is None:
+            db.increment_failed_login(username)
             send_packet(conn, build_login_error_packet(
                 f"No account found for '{username}'.  Sign up first."))
             return None
         if not verify_password(password, stored_hash):
+            db.increment_failed_login(username)
             send_packet(conn, build_login_error_packet("Incorrect password."))
             log.warning(f"Failed login attempt for '{username}'")
             return None
+            
+        db.clear_failed_logins(username)
         send_packet(conn, build_login_ok_packet(username))
         log.info(f"LOGIN  {username}")
         return username

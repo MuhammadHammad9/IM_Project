@@ -77,31 +77,43 @@ def encode_file(file_path: str) -> tuple[str, str, int]:
 
 # ─── Decoding & saving (server side) ─────────────────────────────────────────
 
+import re
+
 def save_file_from_b64(msg_id: str, filename: str, b64_data: str) -> str:
     """
     Decode a base64 string and save the resulting bytes into uploads/.
-
-    Returns the full path where the file was saved.
-    The filename is prefixed with the msg_id to prevent collisions:
-      uploads/msg_3f9bc12_notes.pdf
+    Includes robust path traversal and sanitization checks.
     """
     ensure_uploads_dir()
 
-    # Sanitize filename — strip any directory components
-    safe_name = os.path.basename(filename).replace("..", "")
-    if not safe_name:
+    # Extract filename and validate
+    safe_name = os.path.basename(filename)
+    
+    # Remove all potentially dangerous characters
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', safe_name)
+    safe_name = re.sub(r'^\.+', '_', safe_name)  # Remove leading dots
+    safe_name = safe_name.replace('..', '_')
+    
+    if not safe_name or len(safe_name) > 255:
         safe_name = "file"
 
     # Prefix with msg_id so two people can send files with the same name
     stored_name = f"{msg_id[:8]}_{safe_name}"
     full_path   = os.path.join(UPLOADS_DIR, stored_name)
 
+    # Security check: ensure the resolved path is within UPLOADS_DIR
+    real_path = os.path.realpath(full_path)
+    real_uploads = os.path.realpath(UPLOADS_DIR)
+    
+    if not real_path.startswith(real_uploads):
+        raise ValueError("Invalid file path")
+
     raw_bytes = base64.b64decode(b64_data)
 
-    with open(full_path, "wb") as f:
+    with open(real_path, "wb") as f:
         f.write(raw_bytes)
 
-    return full_path
+    return real_path
 
 
 # ─── Client-side saving ────────────────────────────────────────────────────────

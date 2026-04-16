@@ -133,12 +133,67 @@ class Database:
                   INSERT INTO messages_fts(rowid, msg_id, body, sender, recipient)
                   VALUES (new.id, new.msg_id, new.body, new.sender, new.recipient);
                 END;
+
+                CREATE TABLE IF NOT EXISTS admin_audit_log (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admin      TEXT    NOT NULL,
+                    action     TEXT    NOT NULL,
+                    target     TEXT    NOT NULL,
+                    details    TEXT    DEFAULT '',
+                    timestamp  TEXT    NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS failed_logins (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username     TEXT    NOT NULL,
+                    attempt_time TEXT    DEFAULT CURRENT_TIMESTAMP
+                );
             """)
             self._conn.commit()
 
     # =========================================================================
     # User operations
     # =========================================================================
+
+    def log_admin_action(self, admin: str, action: str, target: str, details: str = ""):
+        """Log all admin actions for audit trail."""
+        timestamp = datetime.datetime.now().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO admin_audit_log (admin, action, target, details, timestamp)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (admin, action, target, details, timestamp)
+            )
+            self._conn.commit()
+
+    def increment_failed_login(self, username: str):
+        """Track failed login attempts."""
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO failed_logins (username, attempt_time)
+                   VALUES (?, datetime('now'))""",
+                (username,)
+            )
+            self._conn.commit()
+
+    def get_recent_failed_logins(self, username: str, minutes: int = 15) -> int:
+        """Get failed attempts in last N minutes."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) FROM failed_logins
+                   WHERE username = ? AND attempt_time > datetime('now', '-' || ? || ' minutes')""",
+                (username, minutes)
+            ).fetchone()
+        return row[0] if row else 0
+
+    def clear_failed_logins(self, username: str):
+        """Clear failed login attempts."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM failed_logins WHERE username = ?",
+                (username,)
+            )
+            self._conn.commit()
 
     def user_exists(self, username: str) -> bool:
         """Check whether a username is already registered."""
@@ -467,6 +522,13 @@ class Database:
         Full-text search: find messages where the body contains `query`.
         Uses FTS5 for efficient searching, returning a snippet and rank.
         """
+        import re
+        sanitized_query = re.sub(r'[*\-:"(){}]', ' ', query.strip())
+        sanitized_query = sanitized_query[:500]  # Limit length
+        
+        if not sanitized_query:
+            return []
+
         with self._lock:
             # Note: snippet args: table, column, start_match, end_match, ellipsis, limit
             rows = self._conn.execute(
@@ -479,7 +541,7 @@ class Database:
                      AND (m.sender = ? OR m.recipient = ? OR m.recipient = 'ALL')
                    ORDER BY rank
                    LIMIT ?""",
-                (query, username, username, limit)
+                (sanitized_query, username, username, limit)
             ).fetchall()
         return [dict(r) for r in rows]
 
