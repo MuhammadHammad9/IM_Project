@@ -1,10 +1,12 @@
 import asyncio
+import os
 import websockets
 
 TCP_HOST = '127.0.0.1'
 TCP_PORT = 5555
 WS_HOST  = '0.0.0.0'
-WS_PORT  = 8080
+# On Render the platform injects $PORT; fall back to 8080 for local development
+WS_PORT  = int(os.environ.get("PORT", 8080))
 
 # 100 MB read buffer — needed for large base64 file packets
 # asyncio's default is only 64 KB which causes LimitOverrunError on image uploads
