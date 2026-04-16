@@ -195,7 +195,8 @@ def _fetch_link_preview(url: str) -> dict:
         parser.feed(html[:50000])  # Only parse first 50 KB to protect parser
         result = {"url": url, **parser.og}
         with _preview_cache_lock:
-            # Evict oldest entry when the cache is full to bound memory usage
+            # Evict the first-inserted (FIFO) entry when the cache is full
+            # to keep memory usage bounded at _PREVIEW_CACHE_MAX entries.
             if len(_preview_cache) >= _PREVIEW_CACHE_MAX:
                 _preview_cache.pop(next(iter(_preview_cache)))
             _preview_cache[url] = result
@@ -598,7 +599,8 @@ def handle_profile_update(data: dict, username: str):
     status_text = data.get("status_text")
 
     # Validate avatar URL: must be empty or an http/https URL pointing to an
-    # external host (prevents javascript: URIs and server-side request forgery).
+    # external host (prevents javascript:, data:, file: and other dangerous
+    # URI schemes, and guards against server-side request forgery).
     if avatar is not None and avatar != "":
         if not avatar.lower().startswith(("http://", "https://")):
             send_to_user(username, build_system_packet("Invalid avatar URL. Must be an http/https URL."))
