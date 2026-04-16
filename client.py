@@ -349,8 +349,10 @@ class IMClient:
         4. Port 80  -> ``ws://{host}:80``
         5. Loopback addresses / ``localhost`` / bare IPv4 on any other port
            -> raw TCP (None).
-        6. Any other hostname on a non-standard port -> ``ws://{host}:{port}``
-           (suitable for a local web_proxy.py instance).
+        6. Any other named remote host -> ``wss://{host}`` (secure WebSocket).
+           Render and similar cloud providers terminate SSL at their reverse proxy
+           and forward plain WebSocket internally, so the client must use wss://
+           (HTTPS path) to avoid having the Connection: Upgrade header stripped.
         """
         h = host.lower().strip()
 
@@ -374,9 +376,11 @@ class IMClient:
         if host in ("localhost", "127.0.0.1", "::1") or re.match(r"^127\.", host):
             return None
 
-        # Named host on a non-standard port -> WebSocket (e.g. web_proxy.py on :8080)
+        # Named remote host -> secure WebSocket (wss://).
+        # Cloud reverse proxies (e.g. Render free tier) strip the Connection header
+        # for plain ws://, but correctly forward wss:// through their HTTPS path.
         if not re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
-            return f"ws://{host}:{port}"
+            return f"wss://{host}"
 
         # Bare IPv4 (non-loopback) on non-standard port -> raw TCP
         return None
