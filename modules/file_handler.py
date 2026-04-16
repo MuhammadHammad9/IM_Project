@@ -42,6 +42,22 @@ _MODULE_DIR    = os.path.dirname(os.path.abspath(__file__))
 UPLOADS_DIR    = os.path.join(_MODULE_DIR, '..', 'uploads')
 MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB
 
+# Allowlist of safe file extensions.
+# SVG is intentionally excluded — it can contain embedded JavaScript.
+# Executable / script extensions (exe, py, sh, php, js, …) are also excluded.
+ALLOWED_EXTENSIONS = {
+    # Images
+    'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'tiff',
+    # Documents
+    'pdf', 'txt', 'md', 'csv',
+    'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+    # Archives
+    'zip', 'tar', 'gz', '7z', 'rar',
+    # Audio / Video
+    'mp3', 'wav', 'ogg', 'flac', 'aac',
+    'mp4', 'webm', 'avi', 'mov', 'mkv',
+}
+
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 
@@ -96,6 +112,15 @@ def save_file_from_b64(msg_id: str, filename: str, b64_data: str) -> str:
     
     if not safe_name or len(safe_name) > 255:
         safe_name = "file"
+
+    # Enforce extension allowlist — rejects SVG (can embed JS), executables,
+    # scripts, and any other type not explicitly permitted.
+    _ext = safe_name.rsplit('.', 1)[-1].lower() if '.' in safe_name else ''
+    if _ext not in ALLOWED_EXTENSIONS:
+        raise ValueError(
+            f"File type '.{_ext}' is not allowed. "
+            f"Permitted types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
 
     # Prefix with msg_id so two people can send files with the same name
     stored_name = f"{msg_id[:8]}_{safe_name}"
