@@ -1026,7 +1026,7 @@ def auth_and_launch(conn: socket.socket, addr):
 # Main accept loop
 # =============================================================================
 
-def start_server():
+def start_server(ready_event=None):
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((HOST, PORT))
@@ -1039,6 +1039,10 @@ def start_server():
     log.info(f"  Uploads   : uploads/")
     log.info(f"  Ctrl+C to stop.")
     log.info("=" * 52)
+
+    # Signal any waiting caller that the socket is bound and ready
+    if ready_event is not None:
+        ready_event.set()
 
     try:
         while True:
@@ -1071,4 +1075,24 @@ if __name__ == "__main__":
     # Start the scheduled message flush background thread
     sched_thread = threading.Thread(target=scheduled_flush_loop, daemon=True)
     sched_thread.start()
-    start_server()
+
+    render_port = os.environ.get("PORT")
+    if render_port:
+        # ── Render deployment ─────────────────────────────────────────────────
+        # Render exposes only HTTP/HTTPS ports, so raw TCP on 5555 is not
+        # reachable from outside.  We start the TCP server on the loopback
+        # interface in a daemon thread and then run the WebSocket proxy as the
+        # main event loop on the port Render injected via $PORT.
+        _tcp_ready = threading.Event()
+        tcp_thread = threading.Thread(target=start_server, args=(_tcp_ready,), daemon=True)
+        tcp_thread.start()
+
+        # Wait until the TCP server has bound its port before the proxy connects
+        _tcp_ready.wait(timeout=10)
+
+        import web_proxy
+        import asyncio
+        asyncio.run(web_proxy.main())
+    else:
+        # ── Local development ─────────────────────────────────────────────────
+        start_server()

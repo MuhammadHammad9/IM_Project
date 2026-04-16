@@ -40,6 +40,7 @@ import json
 import queue
 import time
 import os
+import re
 import datetime
 import base64
 import tkinter as tk
@@ -52,6 +53,70 @@ from modules.messaging    import new_msg_id, now_display
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5555
+
+
+# =============================================================================
+# WebSocket → socket adapter
+# =============================================================================
+
+class _WSWrapper:
+    """
+    Wraps a ``websocket.WebSocket`` object so that it exposes the same
+    ``send`` / ``recv`` / ``close`` / ``shutdown`` interface that the
+    rest of IMClient expects from a plain ``socket.socket``.
+
+    The server sends one JSON object per WebSocket frame (no newline
+    delimiter needed at the WebSocket layer), but ``_read_line`` reads
+    one byte at a time looking for a ``\\n``.  We therefore buffer each
+    incoming frame and append a synthetic ``\\n`` so that ``_read_line``
+    can still locate message boundaries.
+    """
+
+    def __init__(self, ws):
+        self._ws  = ws
+        self._buf = b""
+
+    # ------------------------------------------------------------------
+    def recv(self, n: int) -> bytes:
+        """Return exactly *n* bytes, blocking until a full WebSocket
+        frame is available if the internal buffer is empty."""
+        while len(self._buf) < n:
+            try:
+                frame = self._ws.recv()
+            except Exception:
+                return b""
+            if frame is None:
+                return b""
+            # Each WS frame is one complete JSON line — append \\n so
+            # _read_line() can detect the end of the message.
+            self._buf += (frame + "\n").encode("utf-8")
+        result, self._buf = self._buf[:n], self._buf[n:]
+        return result
+
+    def send(self, data: bytes):
+        """Strip the trailing newline and send as a single text frame."""
+        try:
+            self._ws.send(data.rstrip(b"\n").decode("utf-8"))
+        except Exception:
+            raise OSError("WebSocket send failed")
+
+    def settimeout(self, timeout):
+        try:
+            self._ws.settimeout(timeout)
+        except Exception:
+            pass
+
+    def shutdown(self, how):
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self._ws.close()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -209,12 +274,28 @@ class IMClient:
         t.start()
 
     def _connect_thread(self, host, port, username, password, auth_type):
-        """Background thread: create socket, authenticate, hand off to GUI."""
+        """Background thread: create socket/WebSocket, authenticate, hand off to GUI."""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(7)
-            sock.connect((host, port))
-            sock.settimeout(None)
+            ws_url = self._make_ws_url(host, port)
+
+            if ws_url:
+                # ── WebSocket connection (cloud / Render) ─────────────────────
+                try:
+                    import websocket as _ws_lib
+                except ImportError:
+                    self.root.after(0, lambda: self._login_failed(
+                        "websocket-client is not installed.  "
+                        "Run: pip install websocket-client"))
+                    return
+                _raw_ws = _ws_lib.create_connection(ws_url, timeout=7)
+                sock = _WSWrapper(_raw_ws)
+                sock.settimeout(None)
+            else:
+                # ── Raw TCP connection (local development) ────────────────────
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(7)
+                sock.connect((host, port))
+                sock.settimeout(None)
 
             # Send the auth packet
             packet = {"type": auth_type, "username": username, "password": password}
@@ -228,10 +309,11 @@ class IMClient:
 
             if resp.get("type") == "login_error":
                 sock.close()
-                self.root.after(0, lambda: self._login_failed(resp.get("body", "Auth failed.")))
+                err_body = resp.get("body", "Auth failed.")
+                self.root.after(0, lambda: self._login_failed(err_body))
                 return
 
-            if resp.get("type") == "login_ok":
+            if resp.get("type") in ("login_ok", "signup_ok"):
                 self.sock      = sock
                 self.username  = username
                 self.connected = True
@@ -251,7 +333,54 @@ class IMClient:
             self.root.after(0, lambda: self._login_failed(
                 "Received unreadable data from server."))
         except Exception as e:
-            self.root.after(0, lambda: self._login_failed(f"Error: {e}"))
+            err_msg = str(e)
+            self.root.after(0, lambda: self._login_failed(f"Error: {err_msg}"))
+
+    @staticmethod
+    def _make_ws_url(host: str, port: int):
+        """
+        Decide whether to use WebSocket and return the URL, or return *None*
+        to fall back to a raw TCP socket.
+
+        Rules (in priority order):
+        1. ``ws://…`` or ``wss://…`` prefix -> use as-is.
+        2. ``http://…`` / ``https://…`` prefix -> convert to ws/wss.
+        3. Port 443 -> ``wss://{host}``
+        4. Port 80  -> ``ws://{host}:80``
+        5. Loopback addresses / ``localhost`` / bare IPv4 on any other port
+           -> raw TCP (None).
+        6. Any other hostname on a non-standard port -> ``ws://{host}:{port}``
+           (suitable for a local web_proxy.py instance).
+        """
+        h = host.lower().strip()
+
+        # Explicit WebSocket URL
+        if h.startswith("ws://") or h.startswith("wss://"):
+            return host
+
+        # HTTP(S) -> convert to WS(S), ignoring the port field for HTTPS
+        if h.startswith("https://"):
+            return "wss://" + host[8:]
+        if h.startswith("http://"):
+            return "ws://" + host[7:] + (f":{port}" if port != 80 else "")
+
+        # Standard HTTPS/HTTP ports -> infer protocol
+        if port == 443:
+            return f"wss://{host}"
+        if port == 80:
+            return f"ws://{host}:80"
+
+        # Loopback / localhost -> raw TCP
+        if host in ("localhost", "127.0.0.1", "::1") or re.match(r"^127\.", host):
+            return None
+
+        # Named host on a non-standard port -> WebSocket (e.g. web_proxy.py on :8080)
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+            return f"ws://{host}:{port}"
+
+        # Bare IPv4 (non-loopback) on non-standard port -> raw TCP
+        return None
+
 
     def _login_failed(self, msg: str):
         self.btn_login.config(state=tk.NORMAL, text="Login")
